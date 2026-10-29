@@ -109,6 +109,32 @@ fn list_windows(names: &mut HashMap<u32, String>) -> Vec<WinInfo> {
     list
 }
 
+unsafe extern "system" fn own_enum_proc(h: HWND, lparam: LPARAM) -> BOOL {
+    unsafe {
+        let list = &mut *(lparam.0 as *mut Vec<isize>);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        if pid == std::process::id() {
+            list.push(h.0 as isize);
+        }
+        TRUE
+    }
+}
+
+/// Like Signal's "Screen security": hide this app's own windows from
+/// screenshots, recordings and screen sharing.
+fn set_screen_security(on: bool) -> windows::core::Result<()> {
+    let mut own = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(own_enum_proc), LPARAM(&mut own as *mut _ as isize));
+    }
+    let affinity = if on { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+    for h in own {
+        unsafe { SetWindowDisplayAffinity(hwnd(h), affinity)? };
+    }
+    Ok(())
+}
+
 fn is_alive(h: isize) -> bool {
     unsafe { IsWindow(hwnd(h)).as_bool() }
 }
@@ -267,6 +293,8 @@ struct App {
     opacity: u8,
     topmost: bool,
     status: String,
+    screen_security: bool,
+    screen_security_applied: bool,
 }
 
 impl App {
@@ -283,6 +311,8 @@ impl App {
             opacity: 255,
             topmost: false,
             status: String::new(),
+            screen_security: true,
+            screen_security_applied: false,
         }
     }
 
@@ -505,6 +535,13 @@ impl eframe::App for App {
         }
         ctx.request_repaint_after(REFRESH_EVERY);
 
+        // Applied on the first frame since the native window must exist first
+        if !self.screen_security_applied {
+            self.screen_security_applied = true;
+            let r = set_screen_security(self.screen_security);
+            self.report(r);
+        }
+
         if let Some(w) = &self.selected {
             if !is_alive(w.hwnd) {
                 self.selected = None;
@@ -526,6 +563,17 @@ impl eframe::App for App {
                         if ui.button("⟳  Refresh").clicked() {
                             self.refresh();
                         }
+                        ui.add_space(8.0);
+                        let mut on = self.screen_security;
+                        if toggle(ui, &mut on)
+                            .on_hover_text("Hide this window from screenshots and screen sharing")
+                            .changed()
+                        {
+                            self.screen_security = on;
+                            let r = set_screen_security(on);
+                            self.report(r);
+                        }
+                        ui.label(RichText::new("🔒 Screen security").color(MUTED));
                     });
                 });
             });
