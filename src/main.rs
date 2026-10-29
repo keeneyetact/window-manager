@@ -4,7 +4,7 @@ use eframe::egui::{self, Color32, RichText, Rounding, Sense, Stroke, Vec2};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{BOOL, CloseHandle, COLORREF, HWND, LPARAM, TRUE};
+use windows::Win32::Foundation::{BOOL, CloseHandle, COLORREF, E_FAIL, HWND, LPARAM, TRUE};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -186,6 +186,42 @@ fn set_topmost(h: isize, on: bool) -> windows::core::Result<()> {
     }
 }
 
+// Greys out Close in the system menu, which disables the X button and Alt+F4 on
+// standard windows. Apps that draw their own title bar ignore it.
+fn is_close_locked(h: isize) -> bool {
+    unsafe {
+        let menu = GetSystemMenu(hwnd(h), false);
+        if menu.is_invalid() {
+            return false;
+        }
+        let state = GetMenuState(menu, SC_CLOSE, MF_BYCOMMAND);
+        state != u32::MAX && state & MF_GRAYED.0 != 0
+    }
+}
+
+fn set_close_locked(h: isize, on: bool) -> windows::core::Result<()> {
+    unsafe {
+        let menu = GetSystemMenu(hwnd(h), false);
+        if menu.is_invalid() {
+            return Err(windows::core::Error::new(E_FAIL, "This window has no system menu"));
+        }
+        let flags = MF_BYCOMMAND | if on { MF_GRAYED } else { MF_ENABLED };
+        if EnableMenuItem(menu, SC_CLOSE, flags).0 == -1 {
+            return Err(windows::core::Error::new(E_FAIL, "This window has no Close command"));
+        }
+        // Repaint the caption so the X button reflects the new state.
+        SetWindowPos(
+            hwnd(h),
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )
+    }
+}
+
 fn bring_to_front(h: isize) {
     unsafe {
         if IsIconic(hwnd(h)).as_bool() {
@@ -292,6 +328,7 @@ struct App {
     selected: Option<WinInfo>,
     opacity: u8,
     topmost: bool,
+    close_locked: bool,
     status: String,
     screen_security: bool,
     screen_security_applied: bool,
@@ -310,6 +347,7 @@ impl App {
             selected: None,
             opacity: 255,
             topmost: false,
+            close_locked: false,
             status: String::new(),
             screen_security: true,
             screen_security_applied: false,
@@ -324,6 +362,7 @@ impl App {
     fn select(&mut self, w: WinInfo) {
         self.opacity = get_opacity(w.hwnd);
         self.topmost = is_topmost(w.hwnd);
+        self.close_locked = is_close_locked(w.hwnd);
         self.status.clear();
         self.selected = Some(w);
     }
@@ -502,6 +541,33 @@ impl App {
         }
         ui.add_space(6.0);
 
+        let mut lock = self.close_locked;
+        let mut lock_changed = false;
+        card(ui, &mut |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(RichText::new("Prevent close").strong());
+                    ui.label(
+                        RichText::new("Disable X and Alt+F4 (not for custom title bars)")
+                            .color(MUTED)
+                            .size(12.0),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    lock_changed = toggle(ui, &mut lock).changed();
+                });
+            });
+        });
+        if lock_changed {
+            let r = set_close_locked(w.hwnd, lock);
+            if r.is_ok() {
+                self.close_locked = lock;
+            }
+            self.report(r);
+        }
+        ui.add_space(6.0);
+
         if ui
             .add_sized([ui.available_width(), 32.0], egui::Button::new("↺  Reset window"))
             .clicked()
@@ -510,6 +576,11 @@ impl App {
             if self.topmost {
                 self.topmost = false;
                 let r = set_topmost(w.hwnd, false);
+                self.report(r);
+            }
+            if self.close_locked {
+                self.close_locked = false;
+                let r = set_close_locked(w.hwnd, false);
                 self.report(r);
             }
         }
@@ -550,6 +621,7 @@ impl eframe::App for App {
             } else {
                 // Pick up changes made outside this tool
                 self.topmost = is_topmost(w.hwnd);
+                self.close_locked = is_close_locked(w.hwnd);
             }
         }
 
