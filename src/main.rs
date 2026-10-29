@@ -7,11 +7,12 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{BOOL, CloseHandle, COLORREF, HWND, LPARAM, RECT, TRUE};
+use windows::Win32::Foundation::{BOOL, CloseHandle, COLORREF, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAK, DWMWA_CLOAKED};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PWSTR, w};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -326,6 +327,36 @@ fn hide_main(h: isize) {
     }
 }
 
+/// Minimizing hides the window like closing does. An owned window with no
+/// taskbar button would otherwise linger as a title-bar stub on the desktop.
+unsafe extern "system" fn minimize_to_tray(
+    h: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    unsafe {
+        if msg == WM_SYSCOMMAND && (wparam.0 & 0xFFF0) as u32 == SC_MINIMIZE {
+            let _ = ShowWindow(h, SW_HIDE);
+            return LRESULT(0);
+        }
+        let result = DefSubclassProc(h, msg, wparam, lparam);
+        // Minimized some other way, such as by the shell
+        if msg == WM_SIZE && wparam.0 as u32 == SIZE_MINIMIZED {
+            let _ = ShowWindow(h, SW_HIDE);
+        }
+        result
+    }
+}
+
+fn hide_on_minimize(h: isize) {
+    unsafe {
+        let _ = SetWindowSubclass(hwnd(h), Some(minimize_to_tray), 1, 0);
+    }
+}
+
 /// An owned window gets no taskbar button, so the app lives only in the
 /// tray. The owner is a hidden window that is never shown.
 fn set_hidden_owner(h: isize) {
@@ -550,6 +581,7 @@ impl App {
             _ => 0,
         };
         set_hidden_owner(main);
+        hide_on_minimize(main);
         set_cloak(main, true);
         // Before the tray adds its own hidden window
         let security = set_screen_security(true);
