@@ -8,9 +8,6 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, CloseHandle, COLORREF, HWND, LPARAM, RECT, TRUE};
-use windows::Win32::Graphics::Gdi::{
-    CreateRectRgn, DeleteObject, GetWindowRgnBox, SetWindowRgn, HRGN, NULLREGION, RGN_ERROR,
-};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAK, DWMWA_CLOAKED};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -183,39 +180,36 @@ fn set_opacity(h: isize, alpha: u8) -> windows::core::Result<()> {
     }
 }
 
-const MIN_CROP: i32 = 80;
+const MIN_WIDTH: i32 = 100;
 
-fn window_width(h: isize) -> i32 {
+fn window_size(h: isize) -> (i32, i32) {
     let mut r = RECT::default();
     unsafe {
         let _ = GetWindowRect(hwnd(h), &mut r);
     }
-    r.right - r.left
+    (r.right - r.left, r.bottom - r.top)
 }
 
-/// Width of the strip left visible by `set_crop`, if the window is cropped.
-fn get_crop(h: isize) -> Option<i32> {
-    let mut r = RECT::default();
-    let kind = unsafe { GetWindowRgnBox(hwnd(h), &mut r) };
-    (kind != RGN_ERROR && kind != NULLREGION).then_some(r.right - r.left)
-}
-
-/// Apps such as Chrome refuse to shrink below their own minimum width, so a
-/// window region hides everything right of `width` instead. `None` removes it.
-fn set_crop(h: isize, width: Option<i32>) -> windows::core::Result<()> {
+/// Resizes the window, keeping its left edge and height, and returns the width
+/// it took. Apps can refuse to go below their own minimum (Chrome browser
+/// windows stop near 500 px; `chrome --app=<url>` windows go much narrower).
+fn set_width(h: isize, width: i32) -> windows::core::Result<i32> {
     unsafe {
-        let rgn = match width {
-            // Tall enough to survive the window growing taller
-            Some(w) => CreateRectRgn(0, 0, w, 1 << 15),
-            None => HRGN::default(),
-        };
-        // The system owns the region once it is set
-        if SetWindowRgn(hwnd(h), rgn, TRUE) == 0 {
-            let _ = DeleteObject(rgn);
-            return Err(windows::core::Error::from_win32());
+        if IsZoomed(hwnd(h)).as_bool() {
+            let _ = ShowWindow(hwnd(h), SW_RESTORE);
         }
+        let (_, height) = window_size(h);
+        SetWindowPos(
+            hwnd(h),
+            None,
+            0,
+            0,
+            width,
+            height,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )?;
     }
-    Ok(())
+    Ok(window_size(h).0)
 }
 
 fn is_topmost(h: isize) -> bool {
@@ -534,6 +528,8 @@ struct App {
     selected: Option<WinInfo>,
     opacity: u8,
     topmost: bool,
+    /// Width the selected window stopped at when asked to go narrower.
+    width_floor: Option<i32>,
     /// Levels of pinned windows, top first; a level can hold several windows
     /// that share its rank. Shared with the order keeper thread, which holds
     /// the lock while restacking.
@@ -571,6 +567,7 @@ impl App {
             selected: None,
             opacity: 255,
             topmost: false,
+            width_floor: None,
             order,
             status: String::new(),
             starting: true,
@@ -651,6 +648,7 @@ impl App {
     fn select(&mut self, w: WinInfo) {
         self.opacity = get_opacity(w.hwnd);
         self.topmost = is_topmost(w.hwnd);
+        self.width_floor = None;
         self.status.clear();
         self.selected = Some(w);
     }
@@ -714,9 +712,6 @@ impl App {
                 let alpha = get_opacity(w.hwnd);
                 if alpha < 255 {
                     right = badge(&painter, ui, right, rect.center().y, &format!("{}%", opacity_pct(alpha)), Color32::from_rgb(120, 210, 170));
-                }
-                if let Some(px) = get_crop(w.hwnd) {
-                    right = badge(&painter, ui, right, rect.center().y, &format!("✂ {px}px"), Color32::from_rgb(200, 150, 255));
                 }
                 if is_topmost(w.hwnd) {
                     let label = match level_of(&order, w.hwnd) {
@@ -817,38 +812,51 @@ impl App {
         }
         ui.add_space(6.0);
 
-        let full = window_width(w.hwnd);
-        let crop = get_crop(w.hwnd);
-        let mut new_crop = None;
+        let width = window_size(w.hwnd).0;
+        let screen = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(width);
+        let floor = self.width_floor;
+        let chrome = w.process.to_lowercase().contains("chrome");
+        let mut new_width = None;
         card(ui, &mut |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(RichText::new("Visible width").strong());
-                    ui.label(RichText::new("Hide the right side, past the app's minimum").color(MUTED).size(12.0));
+                    ui.label(RichText::new("Width").strong());
+                    ui.label(RichText::new("Resize the window, keeping its left edge").color(MUTED).size(12.0));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let shown = crop.unwrap_or(full).min(full);
-                    ui.label(RichText::new(format!("{shown} px")).size(18.0).color(ACCENT).strong());
+                    ui.label(RichText::new(format!("{width} px")).size(18.0).color(ACCENT).strong());
                 });
             });
-            let mut px = crop.unwrap_or(full).min(full);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().slider_width = ui.available_width() - 90.0;
-                if ui
-                    .add(egui::Slider::new(&mut px, MIN_CROP.min(full)..=full).show_value(false))
-                    .changed()
-                {
-                    new_crop = Some((px < full).then_some(px));
+            let mut px = width;
+            ui.spacing_mut().slider_width = ui.available_width();
+            if ui
+                .add(egui::Slider::new(&mut px, MIN_WIDTH..=screen).show_value(false))
+                .changed()
+            {
+                new_width = Some(px);
+            }
+            if let Some(f) = floor {
+                let mut note = format!("This window won't go narrower than {f} px.");
+                if chrome {
+                    note += " Chrome app windows opened with chrome --app=<url> go down to about 180 px.";
                 }
-                if ui.add_enabled(crop.is_some(), egui::Button::new("Full width")).clicked() {
-                    new_crop = Some(None);
-                }
-            });
+                ui.label(RichText::new(note).color(MUTED).size(12.0));
+            }
         });
-        if let Some(c) = new_crop {
-            let r = set_crop(w.hwnd, c);
-            self.report(r);
+        if let Some(px) = new_width {
+            match set_width(w.hwnd, px) {
+                Ok(got) => {
+                    self.status.clear();
+                    if got > px {
+                        self.width_floor = Some(got);
+                    } else if floor.is_some_and(|f| px < f) {
+                        // The app's minimum changed, e.g. after a reload
+                        self.width_floor = None;
+                    }
+                }
+                Err(e) => self.report(Err(e)),
+            }
         }
         ui.add_space(6.0);
 
@@ -910,10 +918,6 @@ impl App {
             .clicked()
         {
             self.apply_opacity(w.hwnd, 255);
-            if get_crop(w.hwnd).is_some() {
-                let r = set_crop(w.hwnd, None);
-                self.report(r);
-            }
             if self.topmost {
                 self.pin(w.hwnd, false);
             }
