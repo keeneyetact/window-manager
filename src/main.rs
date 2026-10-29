@@ -1,17 +1,21 @@
 #![windows_subsystem = "windows"]
 
 use eframe::egui::{self, Color32, RichText, Rounding, Sense, Stroke, Vec2};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, CloseHandle, COLORREF, HWND, LPARAM, TRUE};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAK, DWMWA_CLOAKED};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::PWSTR;
+use windows::core::{PWSTR, w};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 const ACCENT: Color32 = Color32::from_rgb(99, 140, 255);
 const BG: Color32 = Color32::from_rgb(22, 24, 30);
@@ -22,6 +26,13 @@ const MUTED: Color32 = Color32::from_rgb(140, 147, 163);
 const DANGER: Color32 = Color32::from_rgb(255, 110, 110);
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 const ORDER_EVERY: Duration = Duration::from_millis(150);
+/// Passed by the Windows startup entry: start in the tray without a window.
+const BACKGROUND_ARG: &str = "--background";
+
+thread_local! {
+    // Kept on the UI thread so Quit can remove the icon before exiting
+    static TRAY: RefCell<Option<TrayIcon>> = const { RefCell::new(None) };
+}
 
 #[derive(Clone)]
 struct WinInfo {
@@ -204,23 +215,32 @@ fn topmost_band() -> Vec<isize> {
     band
 }
 
+/// Index of the stack level holding `h`.
+fn level_of(order: &[Vec<isize>], h: isize) -> Option<usize> {
+    order.iter().position(|l| l.contains(&h))
+}
+
 /// Windows ranks windows that share always-on-top by whichever was activated
-/// last. When pinned windows (`order`, top first) fall out of rank, restack
-/// each one directly below the window ranked above it.
-fn enforce_order(order: &[isize]) {
-    let live: Vec<isize> = order
-        .iter()
-        .copied()
-        .filter(|&h| is_alive(h) && is_topmost(h))
-        .collect();
-    if live.len() < 2 {
-        return;
-    }
+/// last. Pinned windows are kept in levels (`order`, top first); windows on
+/// the same level keep that behaviour among themselves. When a level falls
+/// out of rank, restack every pinned window directly below the one above it,
+/// keeping the current stacking within each level.
+fn enforce_order(order: &[Vec<isize>]) {
     let band = topmost_band();
     let pos = |h: isize| band.iter().position(|&b| b == h).unwrap_or(usize::MAX);
-    if live.windows(2).all(|p| pos(p[0]) < pos(p[1])) {
+    let levels: Vec<Vec<isize>> = order
+        .iter()
+        .map(|l| {
+            let mut l: Vec<isize> = l.iter().copied().filter(|&h| is_alive(h) && is_topmost(h)).collect();
+            l.sort_by_key(|&h| pos(h));
+            l
+        })
+        .filter(|l| !l.is_empty())
+        .collect();
+    if levels.windows(2).all(|p| pos(*p[0].last().unwrap()) < pos(p[1][0])) {
         return;
     }
+    let live = levels.concat();
     for p in live.windows(2) {
         unsafe {
             let _ = SetWindowPos(
@@ -236,7 +256,7 @@ fn enforce_order(order: &[isize]) {
     }
 }
 
-fn spawn_order_keeper(order: Arc<Mutex<Vec<isize>>>) {
+fn spawn_order_keeper(order: Arc<Mutex<Vec<Vec<isize>>>>) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(ORDER_EVERY);
@@ -252,6 +272,129 @@ fn bring_to_front(h: isize) {
         }
         let _ = SetForegroundWindow(hwnd(h));
     }
+}
+
+fn show_main(h: isize) {
+    set_cloak(h, false);
+    // Hiding the window can drop its capture exclusion
+    let _ = set_screen_security(true);
+    unsafe {
+        // winit marks every window as an app window, which forces a taskbar
+        // button even on owned windows; the shell checks this when showing
+        let ex = GetWindowLongPtrW(hwnd(h), GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd(h), GWL_EXSTYLE, ex & !(WS_EX_APPWINDOW.0 as isize));
+        let _ = ShowWindow(hwnd(h), SW_SHOW);
+    }
+    bring_to_front(h);
+}
+
+fn hide_main(h: isize) {
+    unsafe {
+        let _ = ShowWindow(hwnd(h), SW_HIDE);
+    }
+}
+
+/// An owned window gets no taskbar button, so the app lives only in the
+/// tray. The owner is a hidden window that is never shown.
+fn set_hidden_owner(h: isize) {
+    unsafe {
+        if let Ok(owner) = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            w!("Window Manager owner"),
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        ) {
+            SetWindowLongPtrW(hwnd(h), GWLP_HWNDPARENT, owner.0 as isize);
+        }
+    }
+}
+
+/// A cloaked window is drawn nowhere even while Windows considers it shown.
+fn set_cloak(h: isize, on: bool) {
+    let on = BOOL::from(on);
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd(h),
+            DWMWA_CLOAK,
+            &on as *const _ as *const c_void,
+            std::mem::size_of::<BOOL>() as u32,
+        );
+    }
+}
+
+/// A rounded accent tile with two overlapping white windows.
+fn tray_image() -> tray_icon::Icon {
+    const N: i32 = 32;
+    let mut rgba = Vec::with_capacity((N * N * 4) as usize);
+    let inside = |x: i32, y: i32, x0: i32, y0: i32, x1: i32, y1: i32| x >= x0 && x < x1 && y >= y0 && y < y1;
+    for y in 0..N {
+        for x in 0..N {
+            // Corner radius of 6px
+            let (cx, cy) = (x.clamp(6, N - 7), y.clamp(6, N - 7));
+            let tile = (x - cx).pow(2) + (y - cy).pow(2) <= 36;
+            let front = inside(x, y, 12, 13, 26, 25);
+            let back = inside(x, y, 6, 7, 20, 19) && !inside(x, y, 11, 12, 27, 26);
+            let c = if !tile {
+                [0, 0, 0, 0]
+            } else if front || back {
+                [255, 255, 255, 255]
+            } else {
+                [ACCENT.r(), ACCENT.g(), ACCENT.b(), 255]
+            };
+            rgba.extend_from_slice(&c);
+        }
+    }
+    tray_icon::Icon::from_rgba(rgba, N as u32, N as u32).expect("valid icon")
+}
+
+/// Adds the notification-area icon: left click opens the window, the right
+/// click menu opens it or quits the app.
+fn create_tray(ctx: egui::Context, main: isize) -> Result<(), String> {
+    let show = MenuItem::new("Open Window Manager", true, None);
+    let quit = MenuItem::new("Quit", true, None);
+    let menu = Menu::new();
+    menu.append_items(&[&show, &PredefinedMenuItem::separator(), &quit])
+        .map_err(|e| e.to_string())?;
+    let tray = TrayIconBuilder::new()
+        .with_icon(tray_image())
+        .with_tooltip("Window Manager")
+        .with_menu(Box::new(menu))
+        .with_menu_on_left_click(false)
+        .build()
+        .map_err(|e| e.to_string())?;
+    TRAY.with(|t| *t.borrow_mut() = Some(tray));
+
+    let (show_id, quit_id) = (show.id().clone(), quit.id().clone());
+    let menu_ctx = ctx.clone();
+    MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+        if e.id == show_id {
+            show_main(main);
+            menu_ctx.request_repaint();
+        } else if e.id == quit_id {
+            TRAY.with(|t| t.borrow_mut().take());
+            std::process::exit(0);
+        }
+    }));
+    TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
+        if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } = e
+        {
+            show_main(main);
+            ctx.request_repaint();
+        }
+    }));
+    Ok(())
 }
 
 fn opacity_pct(alpha: u8) -> u32 {
@@ -344,6 +487,8 @@ fn setup_style(ctx: &egui::Context) {
 }
 
 struct App {
+    /// This app's own top-level window.
+    main: isize,
     names: HashMap<u32, String>,
     windows: Vec<WinInfo>,
     last_refresh: Instant,
@@ -351,22 +496,36 @@ struct App {
     selected: Option<WinInfo>,
     opacity: u8,
     topmost: bool,
-    /// Pinned windows, top first. Shared with the order keeper thread, which
-    /// holds the lock while restacking.
-    order: Arc<Mutex<Vec<isize>>>,
+    /// Levels of pinned windows, top first; a level can hold several windows
+    /// that share its rank. Shared with the order keeper thread, which holds
+    /// the lock while restacking.
+    order: Arc<Mutex<Vec<Vec<isize>>>>,
     status: String,
-    screen_security: bool,
-    screen_security_applied: bool,
+    /// eframe shows the window itself after the first frame, taskbar button
+    /// and all, so it stays cloaked until it can be hidden on the next one
+    /// and then reshown by `show_main` unless starting in the background.
+    starting: bool,
+    background: bool,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext) -> Self {
+    fn new(cc: &eframe::CreationContext, background: bool) -> Self {
         setup_style(&cc.egui_ctx);
+        let main = match cc.window_handle().map(|h| h.as_raw()) {
+            Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+            _ => 0,
+        };
+        set_hidden_owner(main);
+        set_cloak(main, true);
+        // Before the tray adds its own hidden window
+        let security = set_screen_security(true);
+        let tray = create_tray(cc.egui_ctx.clone(), main);
         let mut names = HashMap::new();
         let windows = list_windows(&mut names);
         let order = Arc::new(Mutex::new(Vec::new()));
         spawn_order_keeper(order.clone());
         let mut app = Self {
+            main,
             names,
             windows,
             last_refresh: Instant::now(),
@@ -376,10 +535,14 @@ impl App {
             topmost: false,
             order,
             status: String::new(),
-            screen_security: true,
-            screen_security_applied: false,
+            starting: true,
+            background,
         };
         app.sync_order();
+        app.report(security);
+        if let Err(e) = tray {
+            app.status = format!("Tray icon unavailable: {e}");
+        }
         app
     }
 
@@ -393,12 +556,16 @@ impl App {
     /// pinned elsewhere on top, keeping their current stacking among themselves.
     fn sync_order(&mut self) {
         let mut order = self.order.lock().unwrap();
-        order.retain(|&h| is_alive(h) && is_topmost(h));
-        let new: Vec<isize> = self
+        for l in order.iter_mut() {
+            l.retain(|&h| is_alive(h) && is_topmost(h));
+        }
+        order.retain(|l| !l.is_empty());
+        let new: Vec<Vec<isize>> = self
             .windows
             .iter()
             .map(|w| w.hwnd)
-            .filter(|&h| is_topmost(h) && !order.contains(&h))
+            .filter(|&h| is_topmost(h) && level_of(&order, h).is_none())
+            .map(|h| vec![h])
             .collect();
         order.splice(0..0, new);
     }
@@ -406,9 +573,12 @@ impl App {
     fn pin(&mut self, h: isize, on: bool) {
         let r = {
             let mut order = self.order.lock().unwrap();
-            order.retain(|&x| x != h);
+            for l in order.iter_mut() {
+                l.retain(|&x| x != h);
+            }
+            order.retain(|l| !l.is_empty());
             if on {
-                order.insert(0, h);
+                order.insert(0, vec![h]);
             }
             set_topmost(h, on)
         };
@@ -416,17 +586,28 @@ impl App {
         self.report(r);
     }
 
-    /// Moves a pinned window `delta` places in the order (negative is up).
-    fn shift(&mut self, h: isize, delta: isize) {
+    /// Moves a pinned window half a step: a window sharing its level gets a
+    /// level of its own just above or below, and a window alone on its level
+    /// joins the next level up or down.
+    fn shift(&mut self, h: isize, up: bool) {
         let mut order = self.order.lock().unwrap();
-        let Some(i) = order.iter().position(|&x| x == h) else {
+        let Some(i) = level_of(&order, h) else {
             return;
         };
-        let j = i as isize + delta;
-        if j >= 0 && (j as usize) < order.len() {
-            order.swap(i, j as usize);
-            enforce_order(&order);
+        if order[i].len() > 1 {
+            order[i].retain(|&x| x != h);
+            order.insert(if up { i } else { i + 1 }, vec![h]);
+        } else if up && i > 0 {
+            order.remove(i);
+            order[i - 1].push(h);
+        } else if !up && i + 1 < order.len() {
+            // The level below moves up into slot `i`
+            order.remove(i);
+            order[i].push(h);
+        } else {
+            return;
         }
+        enforce_order(&order);
     }
 
     fn select(&mut self, w: WinInfo) {
@@ -461,6 +642,7 @@ impl App {
         let filter = self.filter.to_lowercase();
         let selected = self.selected.as_ref().map(|s| s.hwnd);
         let order = self.order.lock().unwrap().clone();
+        let pinned: usize = order.iter().map(Vec::len).sum();
         let mut clicked = None;
         let mut shown = 0;
 
@@ -496,8 +678,8 @@ impl App {
                     right = badge(&painter, ui, right, rect.center().y, &format!("{}%", opacity_pct(alpha)), Color32::from_rgb(120, 210, 170));
                 }
                 if is_topmost(w.hwnd) {
-                    let label = match order.iter().position(|&h| h == w.hwnd) {
-                        Some(i) if order.len() > 1 => format!("📌 #{}", i + 1),
+                    let label = match level_of(&order, w.hwnd) {
+                        Some(i) if pinned > 1 => format!("📌 #{}", i + 1),
                         _ => "📌 TOP".into(),
                     };
                     right = badge(&painter, ui, right, rect.center().y, &label, Color32::from_rgb(255, 196, 90));
@@ -596,10 +778,11 @@ impl App {
 
         let mut top = self.topmost;
         let mut top_changed = false;
-        let mut shift = 0;
-        let (rank, pinned) = {
+        let mut shift = None;
+        let (rank, levels, pinned) = {
             let order = self.order.lock().unwrap();
-            (order.iter().position(|&h| h == w.hwnd), order.len())
+            let rank = level_of(&order, w.hwnd).map(|i| (i, order[i].len() - 1));
+            (rank, order.len(), order.iter().map(Vec::len).sum::<usize>())
         };
         card(ui, &mut |ui| {
             ui.horizontal(|ui| {
@@ -612,16 +795,27 @@ impl App {
                     top_changed = toggle(ui, &mut top).changed();
                 });
             });
-            if let (true, Some(i)) = (self.topmost && pinned > 1, rank) {
+            if let (true, Some((i, others))) = (self.topmost && pinned > 1, rank) {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Stack order #{} of {pinned}", i + 1)).color(MUTED).size(12.0));
+                    let mut text = format!("Stack order #{} of {levels}", i + 1);
+                    match others {
+                        0 => {}
+                        1 => text += ", shared with 1 window",
+                        n => text += &format!(", shared with {n} windows"),
+                    }
+                    ui.label(RichText::new(text).color(MUTED).size(12.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(i + 1 < pinned, egui::Button::new("⏷")).on_hover_text("Move down").clicked() {
-                            shift = 1;
+                        let (up_tip, down_tip) = if others > 0 {
+                            (format!("Move above the others at #{}", i + 1), format!("Move below the others at #{}", i + 1))
+                        } else {
+                            (format!("Share #{}", i), format!("Share #{}", i + 2))
+                        };
+                        if ui.add_enabled(others > 0 || i + 1 < levels, egui::Button::new("⏷")).on_hover_text(down_tip).clicked() {
+                            shift = Some(false);
                         }
-                        if ui.add_enabled(i > 0, egui::Button::new("⏶")).on_hover_text("Move up").clicked() {
-                            shift = -1;
+                        if ui.add_enabled(others > 0 || i > 0, egui::Button::new("⏶")).on_hover_text(up_tip).clicked() {
+                            shift = Some(true);
                         }
                     });
                 });
@@ -630,8 +824,8 @@ impl App {
         if top_changed {
             self.pin(w.hwnd, top);
         }
-        if shift != 0 {
-            self.shift(w.hwnd, shift);
+        if let Some(up) = shift {
+            self.shift(w.hwnd, up);
         }
         ui.add_space(6.0);
 
@@ -666,11 +860,22 @@ impl eframe::App for App {
         }
         ctx.request_repaint_after(REFRESH_EVERY);
 
-        // Applied on the first frame since the native window must exist first
-        if !self.screen_security_applied {
-            self.screen_security_applied = true;
-            let r = set_screen_security(self.screen_security);
-            self.report(r);
+        if self.starting {
+            if ctx.cumulative_pass_nr() == 0 {
+                ctx.request_repaint();
+            } else {
+                self.starting = false;
+                hide_main(self.main);
+                if !self.background {
+                    show_main(self.main);
+                }
+            }
+        }
+
+        // Closing only hides the window; Quit from the tray menu exits
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            hide_main(self.main);
         }
 
         if let Some(w) = &self.selected {
@@ -694,17 +899,6 @@ impl eframe::App for App {
                         if ui.button("⟳  Refresh").clicked() {
                             self.refresh();
                         }
-                        ui.add_space(8.0);
-                        let mut on = self.screen_security;
-                        if toggle(ui, &mut on)
-                            .on_hover_text("Hide this window from screenshots and screen sharing")
-                            .changed()
-                        {
-                            self.screen_security = on;
-                            let r = set_screen_security(on);
-                            self.report(r);
-                        }
-                        ui.label(RichText::new("🔒 Screen security").color(MUTED));
                     });
                 });
             });
@@ -722,12 +916,14 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result<()> {
+    let background = std::env::args().any(|a| a == BACKGROUND_ARG);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Window Manager")
+            .with_taskbar(false)
             .with_inner_size([760.0, 540.0])
             .with_min_inner_size([620.0, 420.0]),
         ..Default::default()
     };
-    eframe::run_native("Window Manager", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    eframe::run_native("Window Manager", options, Box::new(move |cc| Ok(Box::new(App::new(cc, background)))))
 }
