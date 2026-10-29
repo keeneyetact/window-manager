@@ -1,5 +1,7 @@
 #![windows_subsystem = "windows"]
 
+mod mirror;
+
 use eframe::egui::{self, Color32, RichText, Rounding, Sense, Stroke, Vec2};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
@@ -711,6 +713,7 @@ impl App {
         let selected = self.selected.as_ref().map(|s| s.hwnd);
         let order = self.order.lock().unwrap().clone();
         let pinned: usize = order.iter().map(Vec::len).sum();
+        let copies = mirror::counts();
         let mut clicked = None;
         let mut shown = 0;
 
@@ -751,6 +754,9 @@ impl App {
                         _ => "📌 TOP".into(),
                     };
                     right = badge(&painter, ui, right, rect.center().y, &label, Color32::from_rgb(255, 196, 90));
+                }
+                if let Some(n) = copies.get(&w.hwnd) {
+                    right = badge(&painter, ui, right, rect.center().y, &format!("⧉ {n}"), Color32::from_rgb(190, 160, 255));
                 }
 
                 let text_w = (right - rect.left() - 18.0).max(20.0);
@@ -942,6 +948,38 @@ impl App {
         }
         if let Some(up) = shift {
             self.shift(w.hwnd, up);
+        }
+        ui.add_space(6.0);
+
+        let open = mirror::counts().get(&w.hwnd).copied().unwrap_or(0);
+        let (mut new_copy, mut close_copies) = (false, false);
+        card(ui, &mut |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(RichText::new("Live copies").strong());
+                    ui.label(RichText::new("Pictures of the window you can place anywhere").color(MUTED).size(12.0));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(open.to_string()).size(18.0).color(ACCENT).strong());
+                });
+            });
+            ui.horizontal(|ui| {
+                new_copy = ui.button("⧉  New copy").clicked();
+                close_copies = ui.add_enabled(open > 0, egui::Button::new("Close all")).clicked();
+            });
+            ui.label(
+                RichText::new("Drag a copy to move it, drag its edges or scroll to resize, right-click to crop a region.")
+                    .color(MUTED)
+                    .size(12.0),
+            );
+        });
+        if new_copy {
+            let r = mirror::create(w.hwnd);
+            self.report(r);
+        }
+        if close_copies {
+            mirror::close_all(w.hwnd);
         }
         ui.add_space(6.0);
 
