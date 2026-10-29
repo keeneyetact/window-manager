@@ -3,6 +3,7 @@
 use eframe::egui::{self, Color32, RichText, Rounding, Sense, Stroke, Vec2};
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, CloseHandle, COLORREF, HWND, LPARAM, TRUE};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
@@ -20,6 +21,7 @@ const HOVER: Color32 = Color32::from_rgb(46, 51, 63);
 const MUTED: Color32 = Color32::from_rgb(140, 147, 163);
 const DANGER: Color32 = Color32::from_rgb(255, 110, 110);
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
+const ORDER_EVERY: Duration = Duration::from_millis(150);
 
 #[derive(Clone)]
 struct WinInfo {
@@ -186,6 +188,63 @@ fn set_topmost(h: isize, on: bool) -> windows::core::Result<()> {
     }
 }
 
+/// Topmost windows, from the top of the z-order down.
+fn topmost_band() -> Vec<isize> {
+    let mut band = Vec::new();
+    unsafe {
+        let mut next = GetTopWindow(None);
+        while let Ok(h) = next {
+            if h.is_invalid() || !is_topmost(h.0 as isize) {
+                break;
+            }
+            band.push(h.0 as isize);
+            next = GetWindow(h, GW_HWNDNEXT);
+        }
+    }
+    band
+}
+
+/// Windows ranks windows that share always-on-top by whichever was activated
+/// last. When pinned windows (`order`, top first) fall out of rank, restack
+/// each one directly below the window ranked above it.
+fn enforce_order(order: &[isize]) {
+    let live: Vec<isize> = order
+        .iter()
+        .copied()
+        .filter(|&h| is_alive(h) && is_topmost(h))
+        .collect();
+    if live.len() < 2 {
+        return;
+    }
+    let band = topmost_band();
+    let pos = |h: isize| band.iter().position(|&b| b == h).unwrap_or(usize::MAX);
+    if live.windows(2).all(|p| pos(p[0]) < pos(p[1])) {
+        return;
+    }
+    for p in live.windows(2) {
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd(p[1]),
+                hwnd(p[0]),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
+fn spawn_order_keeper(order: Arc<Mutex<Vec<isize>>>) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(ORDER_EVERY);
+            enforce_order(&order.lock().unwrap());
+        }
+    });
+}
+
 fn bring_to_front(h: isize) {
     unsafe {
         if IsIconic(hwnd(h)).as_bool() {
@@ -292,6 +351,9 @@ struct App {
     selected: Option<WinInfo>,
     opacity: u8,
     topmost: bool,
+    /// Pinned windows, top first. Shared with the order keeper thread, which
+    /// holds the lock while restacking.
+    order: Arc<Mutex<Vec<isize>>>,
     status: String,
     screen_security: bool,
     screen_security_applied: bool,
@@ -302,7 +364,9 @@ impl App {
         setup_style(&cc.egui_ctx);
         let mut names = HashMap::new();
         let windows = list_windows(&mut names);
-        Self {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        spawn_order_keeper(order.clone());
+        let mut app = Self {
             names,
             windows,
             last_refresh: Instant::now(),
@@ -310,15 +374,59 @@ impl App {
             selected: None,
             opacity: 255,
             topmost: false,
+            order,
             status: String::new(),
             screen_security: true,
             screen_security_applied: false,
-        }
+        };
+        app.sync_order();
+        app
     }
 
     fn refresh(&mut self) {
         self.windows = list_windows(&mut self.names);
         self.last_refresh = Instant::now();
+        self.sync_order();
+    }
+
+    /// Drops windows that closed or were unpinned elsewhere, and ranks windows
+    /// pinned elsewhere on top, keeping their current stacking among themselves.
+    fn sync_order(&mut self) {
+        let mut order = self.order.lock().unwrap();
+        order.retain(|&h| is_alive(h) && is_topmost(h));
+        let new: Vec<isize> = self
+            .windows
+            .iter()
+            .map(|w| w.hwnd)
+            .filter(|&h| is_topmost(h) && !order.contains(&h))
+            .collect();
+        order.splice(0..0, new);
+    }
+
+    fn pin(&mut self, h: isize, on: bool) {
+        let r = {
+            let mut order = self.order.lock().unwrap();
+            order.retain(|&x| x != h);
+            if on {
+                order.insert(0, h);
+            }
+            set_topmost(h, on)
+        };
+        self.topmost = on;
+        self.report(r);
+    }
+
+    /// Moves a pinned window `delta` places in the order (negative is up).
+    fn shift(&mut self, h: isize, delta: isize) {
+        let mut order = self.order.lock().unwrap();
+        let Some(i) = order.iter().position(|&x| x == h) else {
+            return;
+        };
+        let j = i as isize + delta;
+        if j >= 0 && (j as usize) < order.len() {
+            order.swap(i, j as usize);
+            enforce_order(&order);
+        }
     }
 
     fn select(&mut self, w: WinInfo) {
@@ -352,6 +460,7 @@ impl App {
 
         let filter = self.filter.to_lowercase();
         let selected = self.selected.as_ref().map(|s| s.hwnd);
+        let order = self.order.lock().unwrap().clone();
         let mut clicked = None;
         let mut shown = 0;
 
@@ -387,7 +496,11 @@ impl App {
                     right = badge(&painter, ui, right, rect.center().y, &format!("{}%", opacity_pct(alpha)), Color32::from_rgb(120, 210, 170));
                 }
                 if is_topmost(w.hwnd) {
-                    right = badge(&painter, ui, right, rect.center().y, "📌 TOP", Color32::from_rgb(255, 196, 90));
+                    let label = match order.iter().position(|&h| h == w.hwnd) {
+                        Some(i) if order.len() > 1 => format!("📌 #{}", i + 1),
+                        _ => "📌 TOP".into(),
+                    };
+                    right = badge(&painter, ui, right, rect.center().y, &label, Color32::from_rgb(255, 196, 90));
                 }
 
                 let text_w = (right - rect.left() - 18.0).max(20.0);
@@ -483,6 +596,11 @@ impl App {
 
         let mut top = self.topmost;
         let mut top_changed = false;
+        let mut shift = 0;
+        let (rank, pinned) = {
+            let order = self.order.lock().unwrap();
+            (order.iter().position(|&h| h == w.hwnd), order.len())
+        };
         card(ui, &mut |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
@@ -494,11 +612,26 @@ impl App {
                     top_changed = toggle(ui, &mut top).changed();
                 });
             });
+            if let (true, Some(i)) = (self.topmost && pinned > 1, rank) {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Stack order #{} of {pinned}", i + 1)).color(MUTED).size(12.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled(i + 1 < pinned, egui::Button::new("⏷")).on_hover_text("Move down").clicked() {
+                            shift = 1;
+                        }
+                        if ui.add_enabled(i > 0, egui::Button::new("⏶")).on_hover_text("Move up").clicked() {
+                            shift = -1;
+                        }
+                    });
+                });
+            }
         });
         if top_changed {
-            self.topmost = top;
-            let r = set_topmost(w.hwnd, top);
-            self.report(r);
+            self.pin(w.hwnd, top);
+        }
+        if shift != 0 {
+            self.shift(w.hwnd, shift);
         }
         ui.add_space(6.0);
 
@@ -508,9 +641,7 @@ impl App {
         {
             self.apply_opacity(w.hwnd, 255);
             if self.topmost {
-                self.topmost = false;
-                let r = set_topmost(w.hwnd, false);
-                self.report(r);
+                self.pin(w.hwnd, false);
             }
         }
 
