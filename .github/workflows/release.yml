@@ -6,6 +6,8 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Run from the Actions tab with a tag selected to rebuild that release
+  workflow_dispatch:
 
 permissions:
   contents: write
