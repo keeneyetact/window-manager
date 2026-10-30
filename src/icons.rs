@@ -5,6 +5,7 @@ use crate::hwnd;
 use eframe::egui;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
@@ -17,14 +18,43 @@ use windows::core::PCWSTR;
 /// How long to wait for a busy window to hand over its icon.
 const ASK_MS: u32 = 50;
 
-/// Icons by window, loaded once each. `None` means the window has none, and
-/// the list shows the app's initial instead.
+/// How often to ask again for an icon a window didn't have yet. New windows
+/// often set theirs a moment after they appear.
+const RETRY_EVERY: Duration = Duration::from_secs(2);
+/// How long after first seeing a window to stop asking.
+const GIVE_UP_AFTER: Duration = Duration::from_secs(30);
+
+enum Entry {
+    Loaded(egui::TextureHandle),
+    /// No icon yet: when the window was first seen, and when last asked.
+    Missing { since: Instant, tried: Instant },
+}
+
+/// Icons by window, loaded once each. A window without one shows the app's
+/// initial instead, and is asked again for a while in case it sets one late.
 #[derive(Default)]
-pub struct Icons(HashMap<isize, Option<egui::TextureHandle>>);
+pub struct Icons(HashMap<isize, Entry>);
 
 impl Icons {
     pub fn get(&mut self, ctx: &egui::Context, h: isize, pid: u32) -> Option<egui::TextureHandle> {
-        self.0.entry(h).or_insert_with(|| load(ctx, h, pid)).clone()
+        let now = Instant::now();
+        let since = match self.0.get(&h) {
+            Some(Entry::Loaded(tex)) => return Some(tex.clone()),
+            Some(&Entry::Missing { since, tried }) => {
+                if now - tried < RETRY_EVERY || now - since > GIVE_UP_AFTER {
+                    return None;
+                }
+                since
+            }
+            None => now,
+        };
+        let icon = load(ctx, h, pid);
+        let entry = match &icon {
+            Some(tex) => Entry::Loaded(tex.clone()),
+            None => Entry::Missing { since, tried: now },
+        };
+        self.0.insert(h, entry);
+        icon
     }
 
     /// Forgets windows that have closed.
