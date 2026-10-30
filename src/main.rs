@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod icons;
 mod mirror;
 mod update;
 
@@ -92,11 +93,11 @@ unsafe extern "system" fn enum_proc(h: HWND, lparam: LPARAM) -> BOOL {
     }
 }
 
-fn process_name(pid: u32) -> String {
+/// Full path of the process's exe, unless it can't be read (such as an app
+/// running as administrator).
+pub(crate) fn process_path(pid: u32) -> Option<String> {
     unsafe {
-        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
-            return "unknown".into();
-        };
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 1024];
         let mut size = buf.len() as u32;
         let ok = QueryFullProcessImageNameW(
@@ -107,11 +108,14 @@ fn process_name(pid: u32) -> String {
         )
         .is_ok();
         let _ = CloseHandle(handle);
-        if !ok {
-            return "unknown".into();
-        }
-        let path = String::from_utf16_lossy(&buf[..size as usize]);
-        path.rsplit('\\').next().unwrap_or(&path).to_string()
+        ok.then(|| String::from_utf16_lossy(&buf[..size as usize]))
+    }
+}
+
+fn process_name(pid: u32) -> String {
+    match process_path(pid) {
+        Some(path) => path.rsplit('\\').next().unwrap_or(&path).to_string(),
+        None => "unknown".into(),
     }
 }
 
@@ -575,9 +579,21 @@ fn paint_logo(painter: &egui::Painter, rect: egui::Rect) {
     painter.rect_filled(r(12.0, 13.0, 26.0, 25.0), 1.5 * s, Color32::WHITE);
 }
 
-/// A round tile with the app's initial, tinted per app so rows are easy to
-/// tell apart at a glance.
-fn paint_avatar(painter: &egui::Painter, ui: &egui::Ui, center: egui::Pos2, process: &str) {
+/// The window's own icon, or failing that a round tile with the app's
+/// initial, tinted per app so rows are easy to tell apart at a glance.
+fn paint_avatar(
+    painter: &egui::Painter,
+    ui: &egui::Ui,
+    center: egui::Pos2,
+    process: &str,
+    icon: Option<&egui::TextureHandle>,
+) {
+    if let Some(icon) = icon {
+        let rect = egui::Rect::from_center_size(center, Vec2::splat(26.0));
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        painter.image(icon.id(), rect, uv, Color32::WHITE);
+        return;
+    }
     const TINTS: [Color32; 6] = [
         Color32::from_rgb(99, 140, 255),
         Color32::from_rgb(120, 210, 170),
@@ -683,6 +699,7 @@ struct App {
     starting: bool,
     background: bool,
     update: Arc<Mutex<update::State>>,
+    icons: icons::Icons,
 }
 
 impl App {
@@ -719,6 +736,7 @@ impl App {
             starting: true,
             background,
             update,
+            icons: icons::Icons::default(),
         };
         app.sync_order();
         if let Err(e) = tray {
@@ -730,6 +748,7 @@ impl App {
     fn refresh(&mut self) {
         self.windows = list_windows(&mut self.names);
         self.last_refresh = Instant::now();
+        self.icons.retain(is_alive);
         self.sync_order();
     }
 
@@ -855,12 +874,13 @@ impl App {
             format!("{} of {} windows", matches.len(), self.windows.len())
         };
         ui.label(RichText::new(count).color(MUTED).size(12.0));
+        let icons: Vec<_> = matches.iter().map(|w| self.icons.get(ui.ctx(), w.hwnd, w.pid)).collect();
 
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
             // Room for the scroll bar, so it never covers the badges
             ui.set_max_width(ui.available_width() - 8.0);
-            for w in &matches {
+            for (w, icon) in matches.iter().zip(&icons) {
                 let (rect, resp) =
                     ui.allocate_exact_size(Vec2::new(ui.available_width(), 50.0), Sense::click());
                 let is_sel = selected == Some(w.hwnd);
@@ -893,7 +913,7 @@ impl App {
                     right = badge(&painter, ui, right, rect.center().y, &format!("🗐 {n}"), Color32::from_rgb(190, 160, 255));
                 }
 
-                paint_avatar(&painter, ui, egui::pos2(rect.left() + 27.0, rect.center().y), &w.process);
+                paint_avatar(&painter, ui, egui::pos2(rect.left() + 27.0, rect.center().y), &w.process, icon.as_ref());
                 let text_left = rect.left() + 52.0;
                 let text_w = (right - text_left - 6.0).max(20.0);
                 let title = truncated(ui, &w.title, 14.0, Color32::WHITE, text_w);
@@ -968,11 +988,12 @@ impl App {
             ui.add_space(8.0);
         };
 
+        let icon = self.icons.get(ui.ctx(), w.hwnd, w.pid);
         let mut reset = false;
         card(ui, &mut |ui| {
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
-                paint_avatar(ui.painter(), ui, rect.center(), &w.process);
+                paint_avatar(ui.painter(), ui, rect.center(), &w.process, icon.as_ref());
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
                     let title = truncated(ui, &w.title, 15.0, Color32::WHITE, ui.available_width());
