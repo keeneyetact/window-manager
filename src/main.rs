@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod mirror;
+mod update;
 
 use eframe::egui::{self, Color32, RichText, Rounding, Sense, Stroke, Vec2};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -573,6 +574,7 @@ struct App {
     /// and then reshown by `show_main` unless starting in the background.
     starting: bool,
     background: bool,
+    update: Arc<Mutex<update::State>>,
 }
 
 impl App {
@@ -592,6 +594,8 @@ impl App {
         let windows = list_windows(&mut names);
         let order = Arc::new(Mutex::new(Vec::new()));
         spawn_order_keeper(order.clone());
+        let update = Arc::new(Mutex::new(update::State::Idle));
+        update::spawn_checker(update.clone(), cc.egui_ctx.clone());
         let mut app = Self {
             main,
             names,
@@ -606,6 +610,7 @@ impl App {
             status: String::new(),
             starting: true,
             background,
+            update,
         };
         app.sync_order();
         app.report(security);
@@ -1007,6 +1012,53 @@ impl App {
     }
 }
 
+impl App {
+    fn update_banner(&mut self, ctx: &egui::Context) {
+        let state = self.update.lock().unwrap().clone();
+        if state == update::State::Restart {
+            TRAY.with(|t| t.borrow_mut().take());
+            std::process::exit(0);
+        }
+        if state == update::State::Idle {
+            return;
+        }
+        egui::TopBottomPanel::top("update")
+            .frame(egui::Frame::none().fill(ACCENT.gamma_multiply(0.25)).inner_margin(egui::Margin::symmetric(16.0, 8.0)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| match &state {
+                    update::State::Available { version, page, .. } => {
+                        ui.label(RichText::new(format!("Version {version} is available")).strong());
+                        ui.hyperlink_to("What's new", page);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Later").clicked() {
+                                *self.update.lock().unwrap() = update::State::Idle;
+                            }
+                            if ui.button("⬇  Update now").clicked() {
+                                update::install(self.update.clone(), ctx.clone());
+                            }
+                        });
+                    }
+                    update::State::Downloading { version } => {
+                        ui.spinner();
+                        ui.label(format!("Downloading version {version}…"));
+                    }
+                    update::State::Failed(e) => {
+                        ui.label(RichText::new(e).color(DANGER));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Dismiss").clicked() {
+                                *self.update.lock().unwrap() = update::State::Idle;
+                            }
+                        });
+                    }
+                    _ => {}
+                });
+            });
+        if matches!(state, update::State::Downloading { .. }) {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.last_refresh.elapsed() >= REFRESH_EVERY {
@@ -1048,6 +1100,7 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Window Manager").size(18.0).strong());
+                    ui.label(RichText::new(format!("v{}", update::VERSION)).color(MUTED));
                     ui.label(RichText::new(format!("{} windows", self.windows.len())).color(MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("⟳  Refresh").clicked() {
@@ -1056,6 +1109,8 @@ impl eframe::App for App {
                     });
                 });
             });
+
+        self.update_banner(ctx);
 
         egui::SidePanel::right("details")
             .exact_width(300.0)
