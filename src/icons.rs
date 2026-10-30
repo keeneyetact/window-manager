@@ -18,43 +18,42 @@ use windows::core::PCWSTR;
 /// How long to wait for a busy window to hand over its icon.
 const ASK_MS: u32 = 50;
 
-/// How often to ask again for an icon a window didn't have yet. New windows
-/// often set theirs a moment after they appear.
-const RETRY_EVERY: Duration = Duration::from_secs(2);
-/// How long after first seeing a window to stop asking.
-const GIVE_UP_AFTER: Duration = Duration::from_secs(30);
+/// How often to ask each window which icon it has now. Windows can set or
+/// change theirs at any time, and some are hidden rather than closed, so the
+/// one first seen isn't trusted for good.
+const RECHECK_EVERY: Duration = Duration::from_secs(2);
 
-enum Entry {
-    Loaded(egui::TextureHandle),
-    /// No icon yet: when the window was first seen, and when last asked.
-    Missing { since: Instant, tried: Instant },
+struct Entry {
+    texture: Option<egui::TextureHandle>,
+    /// The window's icon handle the texture was made from, 0 if it had none.
+    source: isize,
+    checked: Instant,
 }
 
-/// Icons by window, loaded once each. A window without one shows the app's
-/// initial instead, and is asked again for a while in case it sets one late.
+/// Icons by window. A window without one shows the app's initial instead.
 #[derive(Default)]
 pub struct Icons(HashMap<isize, Entry>);
 
 impl Icons {
     pub fn get(&mut self, ctx: &egui::Context, h: isize, pid: u32) -> Option<egui::TextureHandle> {
         let now = Instant::now();
-        let since = match self.0.get(&h) {
-            Some(Entry::Loaded(tex)) => return Some(tex.clone()),
-            Some(&Entry::Missing { since, tried }) => {
-                if now - tried < RETRY_EVERY || now - since > GIVE_UP_AFTER {
-                    return None;
-                }
-                since
+        if let Some(e) = self.0.get(&h) {
+            if now - e.checked < RECHECK_EVERY {
+                return e.texture.clone();
             }
-            None => now,
-        };
-        let icon = load(ctx, h, pid);
-        let entry = match &icon {
-            Some(tex) => Entry::Loaded(tex.clone()),
-            None => Entry::Missing { since, tried: now },
-        };
-        self.0.insert(h, entry);
-        icon
+        }
+        let icon = icon_handle(h);
+        let source = icon.map_or(0, |i| i.0 as isize);
+        if let Some(e) = self.0.get_mut(&h) {
+            e.checked = now;
+            // The exe's icon never changes, so a window still without its own keeps it
+            if source == e.source || source == 0 {
+                return e.texture.clone();
+            }
+        }
+        let texture = load(ctx, h, pid, icon);
+        self.0.insert(h, Entry { texture: texture.clone(), source, checked: now });
+        texture
     }
 
     /// Forgets windows that have closed.
@@ -63,15 +62,15 @@ impl Icons {
     }
 }
 
-fn load(ctx: &egui::Context, h: isize, pid: u32) -> Option<egui::TextureHandle> {
-    let (rgba, w, ht) = window_icon(h).or_else(|| exe_icon(pid))?;
+fn load(ctx: &egui::Context, h: isize, pid: u32, icon: Option<HICON>) -> Option<egui::TextureHandle> {
+    let (rgba, w, ht) = icon.and_then(icon_pixels).or_else(|| exe_icon(pid))?;
     let image = egui::ColorImage::from_rgba_unmultiplied([w, ht], &rgba);
     Some(ctx.load_texture(format!("icon-{h}"), image, egui::TextureOptions::LINEAR))
 }
 
-/// The icon the window shows in its title bar and the taskbar. These belong
-/// to the window, so they aren't destroyed here.
-fn window_icon(h: isize) -> Option<(Vec<u8>, usize, usize)> {
+/// The icon the window shows in its title bar and the taskbar, or failing
+/// that its class's. These belong to the window, so they aren't destroyed here.
+fn icon_handle(h: isize) -> Option<HICON> {
     unsafe {
         for kind in [ICON_BIG, ICON_SMALL2, ICON_SMALL] {
             let mut icon = 0usize;
@@ -85,17 +84,13 @@ fn window_icon(h: isize) -> Option<(Vec<u8>, usize, usize)> {
                 Some(&mut icon),
             );
             if icon != 0 {
-                if let Some(pixels) = icon_pixels(HICON(icon as *mut c_void)) {
-                    return Some(pixels);
-                }
+                return Some(HICON(icon as *mut c_void));
             }
         }
         for index in [GCLP_HICON, GCLP_HICONSM] {
             let icon = GetClassLongPtrW(hwnd(h), index);
             if icon != 0 {
-                if let Some(pixels) = icon_pixels(HICON(icon as *mut c_void)) {
-                    return Some(pixels);
-                }
+                return Some(HICON(icon as *mut c_void));
             }
         }
     }
