@@ -11,7 +11,9 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, CloseHandle, COLORREF, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAK, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAK, DWMWA_CLOAKED, DWMWA_USE_IMMERSIVE_DARK_MODE,
+};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -26,6 +28,9 @@ const BG: Color32 = Color32::from_rgb(22, 24, 30);
 const PANEL: Color32 = Color32::from_rgb(30, 33, 41);
 const CARD: Color32 = Color32::from_rgb(38, 42, 52);
 const HOVER: Color32 = Color32::from_rgb(46, 51, 63);
+/// Buttons and slider rails, which sit on cards.
+const CONTROL: Color32 = Color32::from_rgb(52, 58, 72);
+const CONTROL_HOVER: Color32 = Color32::from_rgb(64, 71, 88);
 const MUTED: Color32 = Color32::from_rgb(140, 147, 163);
 const DANGER: Color32 = Color32::from_rgb(255, 110, 110);
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
@@ -138,18 +143,26 @@ unsafe extern "system" fn own_enum_proc(h: HWND, lparam: LPARAM) -> BOOL {
     }
 }
 
+/// Leaves `h` out of screenshots, recordings and screen sharing. Windows
+/// before 10 version 2004 can't exclude a window, so there it shows as black.
+pub(crate) fn hide_from_capture(h: HWND) {
+    unsafe {
+        if SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE).is_err() {
+            let _ = SetWindowDisplayAffinity(h, WDA_MONITOR);
+        }
+    }
+}
+
 /// Like Signal's "Screen security": hide this app's own windows from
 /// screenshots, recordings and screen sharing.
-fn set_screen_security(on: bool) -> windows::core::Result<()> {
+fn set_screen_security() {
     let mut own = Vec::new();
     unsafe {
         let _ = EnumWindows(Some(own_enum_proc), LPARAM(&mut own as *mut _ as isize));
     }
-    let affinity = if on { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
     for h in own {
-        unsafe { SetWindowDisplayAffinity(hwnd(h), affinity)? };
+        hide_from_capture(hwnd(h));
     }
-    Ok(())
 }
 
 fn is_alive(h: isize) -> bool {
@@ -312,8 +325,9 @@ fn bring_to_front(h: isize) {
 
 fn show_main(h: isize) {
     set_cloak(h, false);
+    set_dark_title_bar(h);
     // Hiding the window can drop its capture exclusion
-    let _ = set_screen_security(true);
+    set_screen_security();
     unsafe {
         // winit marks every window as an app window, which forces a taskbar
         // button even on owned windows; the shell checks this when showing
@@ -383,6 +397,29 @@ fn set_hidden_owner(h: isize) {
     }
 }
 
+/// Matches the title bar to the app's dark look in Windows' light mode too.
+fn set_dark_title_bar(h: isize) {
+    let on = TRUE;
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd(h),
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &on as *const _ as *const c_void,
+            std::mem::size_of::<BOOL>() as u32,
+        );
+        // The frame keeps its old colour until it is redrawn
+        let _ = SetWindowPos(
+            hwnd(h),
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
 /// A cloaked window is drawn nowhere even while Windows considers it shown.
 fn set_cloak(h: isize, on: bool) {
     let on = BOOL::from(on);
@@ -396,9 +433,11 @@ fn set_cloak(h: isize, on: bool) {
     }
 }
 
-/// A rounded accent tile with two overlapping white windows.
-fn tray_image() -> tray_icon::Icon {
-    const N: i32 = 32;
+const ICON_SIZE: i32 = 32;
+
+/// A rounded accent tile with two overlapping white windows, as RGBA pixels.
+fn icon_rgba() -> Vec<u8> {
+    const N: i32 = ICON_SIZE;
     let mut rgba = Vec::with_capacity((N * N * 4) as usize);
     let inside = |x: i32, y: i32, x0: i32, y0: i32, x1: i32, y1: i32| x >= x0 && x < x1 && y >= y0 && y < y1;
     for y in 0..N {
@@ -418,7 +457,11 @@ fn tray_image() -> tray_icon::Icon {
             rgba.extend_from_slice(&c);
         }
     }
-    tray_icon::Icon::from_rgba(rgba, N as u32, N as u32).expect("valid icon")
+    rgba
+}
+
+fn tray_image() -> tray_icon::Icon {
+    tray_icon::Icon::from_rgba(icon_rgba(), ICON_SIZE as u32, ICON_SIZE as u32).expect("valid icon")
 }
 
 /// Adds the notification-area icon: left click opens the window, the right
@@ -520,8 +563,62 @@ fn badge(painter: &egui::Painter, ui: &egui::Ui, right: f32, y: f32, text: &str,
     rect.left() - 6.0
 }
 
+/// The app logo: an accent tile with two overlapping windows, as in the tray.
+fn paint_logo(painter: &egui::Painter, rect: egui::Rect) {
+    let s = rect.width() / 32.0;
+    let r = |x0: f32, y0: f32, x1: f32, y1: f32| {
+        egui::Rect::from_min_max(rect.min + Vec2::new(x0, y0) * s, rect.min + Vec2::new(x1, y1) * s)
+    };
+    painter.rect_filled(rect, 7.0 * s, ACCENT);
+    painter.rect_filled(r(6.0, 7.0, 20.0, 19.0), 1.5 * s, Color32::WHITE);
+    painter.rect_filled(r(10.5, 11.5, 27.5, 26.5), 2.0 * s, ACCENT);
+    painter.rect_filled(r(12.0, 13.0, 26.0, 25.0), 1.5 * s, Color32::WHITE);
+}
+
+/// A round tile with the app's initial, tinted per app so rows are easy to
+/// tell apart at a glance.
+fn paint_avatar(painter: &egui::Painter, ui: &egui::Ui, center: egui::Pos2, process: &str) {
+    const TINTS: [Color32; 6] = [
+        Color32::from_rgb(99, 140, 255),
+        Color32::from_rgb(120, 210, 170),
+        Color32::from_rgb(255, 196, 90),
+        Color32::from_rgb(190, 160, 255),
+        Color32::from_rgb(255, 140, 160),
+        Color32::from_rgb(110, 200, 230),
+    ];
+    let name = process.strip_suffix(".exe").unwrap_or(process);
+    let hash = name.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(b.to_ascii_lowercase() as usize));
+    let tint = TINTS[hash % TINTS.len()];
+    let initial: String = name.chars().find(|c| c.is_alphanumeric()).unwrap_or('?').to_uppercase().collect();
+    painter.circle_filled(center, 15.0, tint.gamma_multiply(0.2));
+    let galley = truncated(ui, &initial, 14.0, tint, f32::INFINITY);
+    painter.galley(center - galley.size() / 2.0, galley, tint);
+}
+
+/// A card's title row, with an optional value shown large on the right.
+fn card_title(ui: &mut egui::Ui, title: &str, value: Option<String>) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(title).strong().color(Color32::WHITE));
+        if let Some(value) = value {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(value).size(17.0).color(ACCENT).strong());
+            });
+        }
+    });
+}
+
+fn hint(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.label(RichText::new(text).color(MUTED).size(12.0));
+}
+
 fn setup_style(ctx: &egui::Context) {
+    // egui follows the Windows light/dark setting by default, which would
+    // swap in stock light widgets on top of this app's dark panels
+    ctx.set_theme(egui::Theme::Dark);
+    // Keeps winit from switching the title bar back when the setting changes
+    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
     let mut v = egui::Visuals::dark();
+    v.override_text_color = Some(Color32::from_rgb(226, 230, 238));
     v.panel_fill = BG;
     v.window_fill = PANEL;
     v.extreme_bg_color = CARD;
@@ -536,19 +633,30 @@ fn setup_style(ctx: &egui::Context) {
     ] {
         w.rounding = Rounding::same(8.0);
     }
-    v.widgets.inactive.weak_bg_fill = CARD;
-    v.widgets.inactive.bg_fill = CARD;
-    v.widgets.hovered.weak_bg_fill = HOVER;
-    v.widgets.hovered.bg_fill = HOVER;
+    v.widgets.inactive.weak_bg_fill = CONTROL;
+    v.widgets.inactive.bg_fill = CONTROL;
+    v.widgets.hovered.weak_bg_fill = CONTROL_HOVER;
+    v.widgets.hovered.bg_fill = CONTROL_HOVER;
     v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.6));
     v.widgets.active.weak_bg_fill = ACCENT.gamma_multiply(0.7);
-    ctx.set_visuals(v);
-    ctx.style_mut(|s| {
+    v.widgets.active.bg_fill = ACCENT.gamma_multiply(0.7);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, HOVER);
+    v.widgets.inactive.bg_stroke = Stroke::NONE;
+    // Slider rail and handle
+    v.widgets.inactive.fg_stroke.color = Color32::from_rgb(200, 205, 215);
+    v.slider_trailing_fill = true;
+    v.window_rounding = Rounding::same(10.0);
+    // Both themes get the same look, so a theme change can't undo it
+    ctx.set_visuals_of(egui::Theme::Dark, v.clone());
+    ctx.set_visuals_of(egui::Theme::Light, v);
+    ctx.all_styles_mut(|s| {
         s.spacing.item_spacing = Vec2::new(8.0, 8.0);
         s.spacing.button_padding = Vec2::new(12.0, 6.0);
-        s.spacing.interact_size.y = 24.0;
+        s.spacing.interact_size.y = 26.0;
+        s.spacing.slider_rail_height = 6.0;
         s.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
         s.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+        s.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(11.5));
     });
 }
 
@@ -588,7 +696,7 @@ impl App {
         hide_on_minimize(main);
         set_cloak(main, true);
         // Before the tray adds its own hidden window
-        let security = set_screen_security(true);
+        set_screen_security();
         let tray = create_tray(cc.egui_ctx.clone(), main);
         let mut names = HashMap::new();
         let windows = list_windows(&mut names);
@@ -613,7 +721,6 @@ impl App {
             update,
         };
         app.sync_order();
-        app.report(security);
         if let Err(e) = tray {
             app.status = format!("Tray icon unavailable: {e}");
         }
@@ -695,7 +802,12 @@ impl App {
     fn report(&mut self, r: windows::core::Result<()>) {
         self.status = match r {
             Ok(()) => String::new(),
-            Err(e) => format!("{} — try running as administrator.", e.message()),
+            // Windows of apps running as administrator can't be changed from here
+            Err(e) if e.code() == windows::Win32::Foundation::E_ACCESSDENIED => format!(
+                "{} This window belongs to an app running as administrator. Run Window Manager as administrator to change it.",
+                e.message()
+            ),
+            Err(e) => e.message().to_string(),
         };
     }
 
@@ -706,13 +818,19 @@ impl App {
     }
 
     fn window_list(&mut self, ui: &mut egui::Ui) {
-        ui.add(
+        let search = ui.add(
             egui::TextEdit::singleline(&mut self.filter)
-                .hint_text("🔍  Search windows or apps…")
+                .id(egui::Id::new("search"))
+                .hint_text("🔍  Search windows or apps   (Ctrl+F)")
                 .desired_width(f32::INFINITY)
                 .margin(Vec2::new(10.0, 8.0)),
         );
-        ui.add_space(4.0);
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+            search.request_focus();
+        }
+        if search.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.filter.clear();
+        }
 
         let filter = self.filter.to_lowercase();
         let selected = self.selected.as_ref().map(|s| s.hwnd);
@@ -720,20 +838,31 @@ impl App {
         let pinned: usize = order.iter().map(Vec::len).sum();
         let copies = mirror::counts();
         let mut clicked = None;
-        let mut shown = 0;
+        let matches: Vec<&WinInfo> = self
+            .windows
+            .iter()
+            .filter(|w| {
+                filter.is_empty()
+                    || w.title.to_lowercase().contains(&filter)
+                    || w.process.to_lowercase().contains(&filter)
+            })
+            .collect();
+
+        ui.add_space(2.0);
+        let count = if filter.is_empty() {
+            format!("{} open windows", self.windows.len())
+        } else {
+            format!("{} of {} windows", matches.len(), self.windows.len())
+        };
+        ui.label(RichText::new(count).color(MUTED).size(12.0));
 
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
-            for w in &self.windows {
-                if !filter.is_empty()
-                    && !w.title.to_lowercase().contains(&filter)
-                    && !w.process.to_lowercase().contains(&filter)
-                {
-                    continue;
-                }
-                shown += 1;
+            // Room for the scroll bar, so it never covers the badges
+            ui.set_max_width(ui.available_width() - 8.0);
+            for w in &matches {
                 let (rect, resp) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 48.0), Sense::click());
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 50.0), Sense::click());
                 let is_sel = selected == Some(w.hwnd);
                 let painter = ui.painter_at(rect);
                 let fill = if is_sel {
@@ -761,22 +890,27 @@ impl App {
                     right = badge(&painter, ui, right, rect.center().y, &label, Color32::from_rgb(255, 196, 90));
                 }
                 if let Some(n) = copies.get(&w.hwnd) {
-                    right = badge(&painter, ui, right, rect.center().y, &format!("⧉ {n}"), Color32::from_rgb(190, 160, 255));
+                    right = badge(&painter, ui, right, rect.center().y, &format!("🗐 {n}"), Color32::from_rgb(190, 160, 255));
                 }
 
-                let text_w = (right - rect.left() - 18.0).max(20.0);
+                paint_avatar(&painter, ui, egui::pos2(rect.left() + 27.0, rect.center().y), &w.process);
+                let text_left = rect.left() + 52.0;
+                let text_w = (right - text_left - 6.0).max(20.0);
                 let title = truncated(ui, &w.title, 14.0, Color32::WHITE, text_w);
                 let proc_ = truncated(ui, &w.process, 11.5, MUTED, text_w);
-                painter.galley(rect.left_top() + Vec2::new(14.0, 8.0), title, Color32::WHITE);
-                painter.galley(rect.left_top() + Vec2::new(14.0, 28.0), proc_, MUTED);
+                painter.galley(egui::pos2(text_left, rect.top() + 8.0), title, Color32::WHITE);
+                painter.galley(egui::pos2(text_left, rect.top() + 28.0), proc_, MUTED);
 
                 if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    clicked = Some(w.clone());
+                    clicked = Some((*w).clone());
                 }
             }
-            if shown == 0 {
-                ui.add_space(30.0);
-                ui.vertical_centered(|ui| ui.label(RichText::new("No matching windows").color(MUTED)));
+            if matches.is_empty() {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("No matching windows").strong());
+                    hint(ui, "Try a different search, or clear it with Esc.");
+                });
             }
         });
 
@@ -787,14 +921,39 @@ impl App {
 
     fn details(&mut self, ui: &mut egui::Ui) {
         let Some(w) = self.selected.clone() else {
-            ui.add_space(ui.available_height() * 0.35);
+            ui.add_space((ui.available_height() * 0.3).max(20.0));
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("🪟").size(40.0));
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::hover());
+                paint_logo(ui.painter(), rect);
+                ui.add_space(6.0);
                 ui.label(RichText::new("No window selected").size(16.0).strong());
-                ui.label(RichText::new("Pick a window from the list\nto adjust it.").color(MUTED));
+                hint(ui, "Pick a window from the list to change its\nopacity, width, stacking or make live copies.");
             });
             return;
         };
+
+        // Errors go first so they can't end up scrolled out of view
+        if !self.status.is_empty() {
+            let mut dismiss = false;
+            egui::Frame::none()
+                .fill(DANGER.gamma_multiply(0.15))
+                .rounding(10.0)
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_top(|ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(format!("⚠  {}", self.status)).color(DANGER).size(12.5))
+                                .wrap(),
+                        );
+                    });
+                    dismiss = ui.small_button("Dismiss").clicked();
+                });
+            if dismiss {
+                self.status.clear();
+            }
+            ui.add_space(8.0);
+        }
 
         let card = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
             egui::Frame::none()
@@ -803,31 +962,49 @@ impl App {
                 .inner_margin(14.0)
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 6.0;
                     add(ui)
                 });
+            ui.add_space(8.0);
         };
 
+        let mut reset = false;
         card(ui, &mut |ui| {
-            let width = ui.available_width();
-            let title = truncated(ui, &w.title, 16.0, Color32::WHITE, width);
-            ui.label(title);
-            ui.label(RichText::new(&w.process).color(MUTED).size(12.0));
-            ui.add_space(2.0);
-            if ui.button("↗  Bring to front").clicked() {
-                bring_to_front(w.hwnd);
-            }
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
+                paint_avatar(ui.painter(), ui, rect.center(), &w.process);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    let title = truncated(ui, &w.title, 15.0, Color32::WHITE, ui.available_width());
+                    ui.label(title).on_hover_text(&w.title);
+                    hint(ui, &w.process);
+                });
+            });
+            ui.horizontal(|ui| {
+                let bw = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                if ui
+                    .add_sized([bw, 30.0], egui::Button::new("↗  Bring to front"))
+                    .clicked()
+                {
+                    bring_to_front(w.hwnd);
+                }
+                reset = ui
+                    .add_sized([bw, 30.0], egui::Button::new("↺  Reset"))
+                    .on_hover_text("Full opacity and not pinned on top")
+                    .clicked();
+            });
         });
-        ui.add_space(6.0);
+        if reset {
+            self.apply_opacity(w.hwnd, 255);
+            if self.topmost {
+                self.pin(w.hwnd, false);
+            }
+        }
 
         let mut new_alpha = None;
         let alpha = self.opacity;
         card(ui, &mut |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Opacity").strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(format!("{}%", opacity_pct(alpha))).size(18.0).color(ACCENT).strong());
-                });
-            });
+            card_title(ui, "Opacity", Some(format!("{}%", opacity_pct(alpha))));
             let mut pct = alpha as f32 / 255.0 * 100.0;
             ui.spacing_mut().slider_width = ui.available_width();
             if ui
@@ -843,7 +1020,7 @@ impl App {
                     let active = opacity_pct(alpha) == p;
                     let btn = egui::Button::new(RichText::new(format!("{p}%")).size(13.0))
                         .min_size(Vec2::new(bw, 28.0))
-                        .fill(if active { ACCENT.gamma_multiply(0.5) } else { PANEL });
+                        .fill(if active { ACCENT.gamma_multiply(0.5) } else { CONTROL });
                     if ui.add(btn).clicked() {
                         new_alpha = Some(pct_to_alpha(p as f32));
                     }
@@ -853,7 +1030,6 @@ impl App {
         if let Some(a) = new_alpha {
             self.apply_opacity(w.hwnd, a);
         }
-        ui.add_space(6.0);
 
         let width = window_size(w.hwnd).0;
         let screen = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(width);
@@ -861,16 +1037,8 @@ impl App {
         let chrome = w.process.to_lowercase().contains("chrome");
         let mut new_width = None;
         card(ui, &mut |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(RichText::new("Width").strong());
-                    ui.label(RichText::new("Resize the window, keeping its left edge").color(MUTED).size(12.0));
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(format!("{width} px")).size(18.0).color(ACCENT).strong());
-                });
-            });
+            card_title(ui, "Width", Some(format!("{width} px")));
+            hint(ui, "Resizes the window, keeping its left edge in place.");
             let mut px = width;
             ui.spacing_mut().slider_width = ui.available_width();
             if ui
@@ -884,7 +1052,7 @@ impl App {
                 if chrome {
                     note += " Chrome app windows opened with chrome --app=<url> go down to about 180 px.";
                 }
-                ui.label(RichText::new(note).color(MUTED).size(12.0));
+                hint(ui, note);
             }
         });
         if let Some(px) = new_width {
@@ -901,7 +1069,6 @@ impl App {
                 Err(e) => self.report(Err(e)),
             }
         }
-        ui.add_space(6.0);
 
         let mut top = self.topmost;
         let mut top_changed = false;
@@ -913,35 +1080,35 @@ impl App {
         };
         card(ui, &mut |ui| {
             ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(RichText::new("Always on top").strong());
-                    ui.label(RichText::new("Keep above other windows").color(MUTED).size(12.0));
-                });
+                ui.label(RichText::new("Always on top").strong().color(Color32::WHITE));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     top_changed = toggle(ui, &mut top).changed();
                 });
             });
+            hint(ui, "Keeps the window above other windows.");
             if let (true, Some((i, others))) = (self.topmost && pinned > 1, rank) {
-                ui.add_space(4.0);
+                ui.separator();
                 ui.horizontal(|ui| {
-                    let mut text = format!("Stack order #{} of {levels}", i + 1);
-                    match others {
-                        0 => {}
-                        1 => text += ", shared with 1 window",
-                        n => text += &format!(", shared with {n} windows"),
-                    }
-                    ui.label(RichText::new(text).color(MUTED).size(12.0));
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.label(RichText::new(format!("Stack order #{} of {levels}", i + 1)).size(13.0));
+                        match others {
+                            0 => {}
+                            1 => hint(ui, "Shared with 1 window"),
+                            n => hint(ui, format!("Shared with {n} windows")),
+                        }
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (up_tip, down_tip) = if others > 0 {
                             (format!("Move above the others at #{}", i + 1), format!("Move below the others at #{}", i + 1))
                         } else {
                             (format!("Share #{}", i), format!("Share #{}", i + 2))
                         };
-                        if ui.add_enabled(others > 0 || i + 1 < levels, egui::Button::new("⏷")).on_hover_text(down_tip).clicked() {
+                        let arrow = |s: &str| egui::Button::new(s).min_size(Vec2::new(32.0, 28.0));
+                        if ui.add_enabled(others > 0 || i + 1 < levels, arrow("⏷")).on_hover_text(down_tip).clicked() {
                             shift = Some(false);
                         }
-                        if ui.add_enabled(others > 0 || i > 0, egui::Button::new("⏶")).on_hover_text(up_tip).clicked() {
+                        if ui.add_enabled(others > 0 || i > 0, arrow("⏶")).on_hover_text(up_tip).clicked() {
                             shift = Some(true);
                         }
                     });
@@ -954,30 +1121,21 @@ impl App {
         if let Some(up) = shift {
             self.shift(w.hwnd, up);
         }
-        ui.add_space(6.0);
 
         let open = mirror::counts().get(&w.hwnd).copied().unwrap_or(0);
         let (mut new_copy, mut close_copies) = (false, false);
         card(ui, &mut |ui| {
+            card_title(ui, "Live copies", (open > 0).then(|| format!("{open} open")));
+            hint(ui, "Live pictures of the window that you can place anywhere.");
             ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(RichText::new("Live copies").strong());
-                    ui.label(RichText::new("Pictures of the window you can place anywhere").color(MUTED).size(12.0));
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(open.to_string()).size(18.0).color(ACCENT).strong());
-                });
+                let bw = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                new_copy = ui.add_sized([bw, 30.0], egui::Button::new("🗐  New copy")).clicked();
+                close_copies = ui
+                    .add_enabled_ui(open > 0, |ui| ui.add_sized([bw, 30.0], egui::Button::new("Close all")))
+                    .inner
+                    .clicked();
             });
-            ui.horizontal(|ui| {
-                new_copy = ui.button("⧉  New copy").clicked();
-                close_copies = ui.add_enabled(open > 0, egui::Button::new("Close all")).clicked();
-            });
-            ui.label(
-                RichText::new("Drag a copy to move it, drag its edges or scroll to resize, right-click to crop a region.")
-                    .color(MUTED)
-                    .size(12.0),
-            );
+            hint(ui, "Drag a copy to move it. Drag its edges or scroll to resize. Right-click it to crop a region.");
         });
         if new_copy {
             let r = mirror::create(w.hwnd);
@@ -985,29 +1143,6 @@ impl App {
         }
         if close_copies {
             mirror::close_all(w.hwnd);
-        }
-        ui.add_space(6.0);
-
-        if ui
-            .add_sized([ui.available_width(), 32.0], egui::Button::new("↺  Reset window"))
-            .clicked()
-        {
-            self.apply_opacity(w.hwnd, 255);
-            if self.topmost {
-                self.pin(w.hwnd, false);
-            }
-        }
-
-        if !self.status.is_empty() {
-            ui.add_space(6.0);
-            egui::Frame::none()
-                .fill(DANGER.gamma_multiply(0.15))
-                .rounding(8.0)
-                .inner_margin(10.0)
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(RichText::new(format!("⚠  {}", self.status)).color(DANGER).size(12.5));
-                });
         }
     }
 }
@@ -1096,14 +1231,15 @@ impl eframe::App for App {
         }
 
         egui::TopBottomPanel::top("header")
-            .frame(egui::Frame::none().fill(PANEL).inner_margin(egui::Margin::symmetric(16.0, 12.0)))
+            .frame(egui::Frame::none().fill(PANEL).inner_margin(egui::Margin::symmetric(16.0, 10.0)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Window Manager").size(18.0).strong());
-                    ui.label(RichText::new(format!("v{}", update::VERSION)).color(MUTED));
-                    ui.label(RichText::new(format!("{} windows", self.windows.len())).color(MUTED));
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
+                    paint_logo(ui.painter(), rect);
+                    ui.label(RichText::new("Window Manager").size(17.0).strong().color(Color32::WHITE));
+                    ui.label(RichText::new(format!("v{}", update::VERSION)).color(MUTED).size(12.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("⟳  Refresh").clicked() {
+                        if ui.button("⟳  Refresh").on_hover_text("The list also refreshes by itself").clicked() {
                             self.refresh();
                         }
                     });
@@ -1112,27 +1248,74 @@ impl eframe::App for App {
 
         self.update_banner(ctx);
 
+        // The details take a bit over a third of the window, within limits
+        let details_w = (ctx.screen_rect().width() * 0.42).clamp(290.0, 360.0);
         egui::SidePanel::right("details")
-            .exact_width(300.0)
+            .exact_width(details_w)
             .resizable(false)
-            .frame(egui::Frame::none().fill(BG).inner_margin(14.0))
-            .show(ctx, |ui| self.details(ui));
+            .show_separator_line(false)
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin { left: 6.0, right: 8.0, top: 14.0, bottom: 0.0 }))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    ui.set_max_width(ui.available_width() - 6.0);
+                    self.details(ui);
+                    ui.add_space(6.0);
+                });
+            });
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin { left: 14.0, right: 0.0, top: 14.0, bottom: 14.0 }))
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin { left: 14.0, right: 6.0, top: 14.0, bottom: 0.0 }))
             .show(ctx, |ui| self.window_list(ui));
     }
 }
 
-fn main() -> eframe::Result<()> {
+/// The starting size: roomy, but never larger than the screen it opens on.
+fn initial_size() -> [f32; 2] {
+    let mut work = RECT::default();
+    let scale = unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut work as *mut _ as *mut c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        // Matches the work area: 96 until eframe makes the app DPI aware
+        windows::Win32::UI::HiDpi::GetDpiForSystem().max(96) as f32 / 96.0
+    };
+    let (w, h) = ((work.right - work.left) as f32 / scale, (work.bottom - work.top) as f32 / scale);
+    if w <= 0.0 || h <= 0.0 {
+        return [860.0, 600.0];
+    }
+    [860f32.min(w * 0.9).max(MIN_SIZE[0]), 600f32.min(h * 0.9).max(MIN_SIZE[1])]
+}
+
+const MIN_SIZE: [f32; 2] = [600.0, 400.0];
+
+fn main() {
     let background = std::env::args().any(|a| a == BACKGROUND_ARG);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Window Manager")
+            .with_icon(egui::IconData { rgba: icon_rgba(), width: ICON_SIZE as u32, height: ICON_SIZE as u32 })
             .with_taskbar(false)
-            .with_inner_size([760.0, 540.0])
-            .with_min_inner_size([620.0, 420.0]),
+            .with_inner_size(initial_size())
+            .with_min_inner_size(MIN_SIZE),
+        centered: true,
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            // A tray app has no need to wake a laptop's discrete GPU
+            power_preference: eframe::wgpu::PowerPreference::LowPower,
+            ..Default::default()
+        },
         ..Default::default()
     };
-    eframe::run_native("Window Manager", options, Box::new(move |cc| Ok(Box::new(App::new(cc, background)))))
+    let result =
+        eframe::run_native("Window Manager", options, Box::new(move |cc| Ok(Box::new(App::new(cc, background)))));
+    // There is no console, so say why instead of vanishing
+    if let Err(e) = result {
+        let text: Vec<u16> = format!("Window Manager couldn't start.\n\n{e}\0").encode_utf16().collect();
+        unsafe {
+            MessageBoxW(None, windows::core::PCWSTR(text.as_ptr()), w!("Window Manager"), MB_OK | MB_ICONERROR);
+        }
+    }
 }

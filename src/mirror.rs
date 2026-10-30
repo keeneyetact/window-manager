@@ -232,7 +232,7 @@ pub fn create(source: isize) -> windows::core::Result<()> {
             )
         });
         // Matches the rest of the app, which stays out of screen captures
-        let _ = SetWindowDisplayAffinity(copy, WDA_EXCLUDEFROMCAPTURE);
+        crate::hide_from_capture(copy);
         update(copy);
         SetTimer(copy, 1, WATCH_MS, None);
         let _ = ShowWindow(copy, SW_SHOWNOACTIVATE);
@@ -313,7 +313,7 @@ fn move_band(h: HWND, r: RECT) {
                 return;
             };
             let _ = SetLayeredWindowAttributes(b, COLORREF(0), 90, LWA_ALPHA);
-            let _ = SetWindowDisplayAffinity(b, WDA_EXCLUDEFROMCAPTURE);
+            crate::hide_from_capture(b);
             let _ = ShowWindow(b, SW_SHOWNOACTIVATE);
             with(h, |m| {
                 if let Some(s) = &mut m.select {

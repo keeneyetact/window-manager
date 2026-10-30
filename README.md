@@ -28,7 +28,7 @@ Pick any open window from a searchable list, then:
 | 🙈 | **Hidden from screen capture** | Window Manager and its live copies don't show up in screenshots, screen recordings or screen sharing. |
 | 🔄 | **Automatic updates** | Checks for new versions and updates itself in one click. |
 
-**Reset window** sets a window back to full opacity and unpins it.
+**↺ Reset** sets a window back to full opacity and unpins it.
 
 ---
 
@@ -70,7 +70,7 @@ Each row shows the window's title and the app it belongs to. Badges on the right
 
 - **`60%`** means the window's opacity has been changed.
 - **`📌 TOP`** or **`📌 #2`** means it's pinned on top, with its position in the stack.
-- **`⧉ 3`** is the number of live copies that are open.
+- **`🗐 3`** is the number of live copies that are open.
 
 The list refreshes by itself every couple of seconds. You can also click **⟳ Refresh**.
 
@@ -104,7 +104,7 @@ Window Manager checks the order several times a second and fixes it if something
 
 A live copy is a moving picture of a window that updates as the original changes. It's only a picture, so clicks and typing never reach the original. That means you can move, resize, crop and close copies without any risk to the real window.
 
-Click **⧉ New copy** to make one. Then:
+Click **🗐 New copy** to make one. Then:
 
 | Do this | To |
 |---|---|
