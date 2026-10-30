@@ -1,0 +1,39 @@
+# Builds windows-manager.exe and publishes it as a GitHub release whenever a
+# version tag is pushed:  git tag v0.2.0 && git push origin v0.2.0
+# The app's updater looks for an asset named exactly windows-manager.exe.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml version
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/windows-manager.exe
+          generate_release_notes: true
